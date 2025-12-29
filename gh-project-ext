@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+#
+# gh-project-ext - GitHub Projects V2 Kanban board management
+#
+# A GitHub CLI extension for managing GitHub Projects V2 boards with
+# Kanban-style workflows (Status columns, Priority swimlanes).
+#
+# Usage:
+#   gh project-ext <command> [options]
+#
+# Commands:
+#   setup                Configure default project
+#   ready                List items in Ready status
+#   board                Show Kanban board overview
+#   move <issue> <status> Move item to new status
+#   claim <issue>        Assign to me and move to In Progress
+#   show                 Display project structure
+#
+# Global options:
+#   --owner <owner>      Project owner (user or org)
+#   --project <number>   Project number
+#   --all                Include sub-issues (default: top-level only)
+#   --all-repos          Include all repositories (default: current repo only)
+#   --json               Output as JSON
+#   -h, --help           Show help
+#
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Global variables
+OWNER=""
+PROJECT=""
+ALL_ITEMS=false
+ALL_REPOS=false
+JSON_OUTPUT=false
+CONFIG_FILE=""
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gh-project-ext"
+
+#######################################
+# Print colored output
+#######################################
+print_color() {
+    local color="$1"
+    local message="$2"
+    echo -e "${color}${message}${NC}"
+}
+
+print_error() {
+    print_color "$RED" "Error: $1" >&2
+}
+
+print_success() {
+    print_color "$GREEN" "$1"
+}
+
+print_info() {
+    print_color "$CYAN" "$1"
+}
+
+print_warning() {
+    print_color "$YELLOW" "$1"
+}
+
+#######################################
+# Show help
+#######################################
+show_help() {
+    cat << 'EOF'
+gh project-ext - GitHub Projects V2 Kanban board management
+
+USAGE
+  gh project-ext <command> [options]
+
+COMMANDS
+  setup                 Configure default project (interactive)
+  ready                 List items in Ready status, sorted by priority
+  board                 Show Kanban board overview
+  move <issue> <status> Move an item to a new status
+  claim <issue>         Assign to me and move to In Progress
+  show                  Display project structure and fields
+
+GLOBAL OPTIONS
+  --owner <owner>       Project owner (user or org login)
+  --project <number>    Project number
+  --all                 Include sub-issues (default: top-level only)
+  --all-repos           Include all repos (default: current repo only)
+  --json                Output as JSON
+  -h, --help            Show this help message
+
+CONFIGURATION
+  The extension looks for configuration in:
+    1. .github-project in current directory (or git root)
+    2. ~/.config/gh-project-ext/config
+
+  Config file format:
+    owner: jwilger
+    project: 11
+
+EXAMPLES
+  # Initial setup
+  gh project-ext setup
+
+  # List ready items
+  gh project-ext ready
+
+  # Show board with all items (including sub-issues)
+  gh project-ext board --all
+
+  # Move issue to In Progress
+  gh project-ext move 42 "In progress"
+
+  # Claim an issue (assign + move to In Progress)
+  gh project-ext claim 42
+
+  # Show project structure
+  gh project-ext show
+EOF
+}
+
+#######################################
+# Find and load configuration
+#######################################
+find_config() {
+    # Check for .github-project in current directory or git root
+    local git_root
+    if git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+        if [[ -f "$git_root/.github-project" ]]; then
+            CONFIG_FILE="$git_root/.github-project"
+            return 0
+        fi
+    fi
+
+    if [[ -f ".github-project" ]]; then
+        CONFIG_FILE=".github-project"
+        return 0
+    fi
+
+    # Check for global config
+    local global_config="${XDG_CONFIG_HOME:-$HOME/.config}/gh-project-ext/config"
+    if [[ -f "$global_config" ]]; then
+        CONFIG_FILE="$global_config"
+        return 0
+    fi
+
+    return 1
+}
+
+load_config() {
+    if [[ -z "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+
+    # Parse simple YAML-like format
+    while IFS=': ' read -r key value; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
+        # Remove quotes if present
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+
+        case "$key" in
+            owner) [[ -z "$OWNER" ]] && OWNER="$value" ;;
+            project) [[ -z "$PROJECT" ]] && PROJECT="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+#######################################
+# Ensure we have owner and project
+#######################################
+ensure_config() {
+    if [[ -z "$OWNER" || -z "$PROJECT" ]]; then
+        print_error "No project configured. Run 'gh project-ext setup' first."
+        print_info "Or specify --owner and --project flags."
+        exit 1
+    fi
+}
+
+#######################################
+# Get current repository
+#######################################
+get_current_repo() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null) || return 1
+
+    # Parse GitHub repo from URL
+    # Handles: git@github.com:owner/repo.git, https://github.com/owner/repo.git
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
+        echo "https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    return 1
+}
+
+#######################################
+# Get field information (cached)
+#######################################
+get_fields() {
+    mkdir -p "$CACHE_DIR"
+    local cache_file="$CACHE_DIR/fields-${OWNER}-${PROJECT}.json"
+    local cache_age=3600 # 1 hour
+
+    # Check cache freshness
+    if [[ -f "$cache_file" ]]; then
+        local file_age=$(($(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file")))
+        if [[ $file_age -lt $cache_age ]]; then
+            cat "$cache_file"
+            return 0
+        fi
+    fi
+
+    # Fetch and cache
+    local fields
+    fields=$(gh project field-list "$PROJECT" --owner "$OWNER" --format json)
+    echo "$fields" > "$cache_file"
+    echo "$fields"
+}
+
+#######################################
+# Resolve status name to option ID
+#######################################
+resolve_status_id() {
+    local status_name="$1"
+    local fields
+    fields=$(get_fields)
+
+    # Find Status field and match option
+    echo "$fields" | jq -r --arg name "$status_name" '
+        .fields[] |
+        select(.name == "Status" and .type == "ProjectV2SingleSelectField") |
+        .options[] |
+        select(.name | ascii_downcase == ($name | ascii_downcase)) |
+        .id
+    '
+}
+
+#######################################
+# Get Status field ID
+#######################################
+get_status_field_id() {
+    local fields
+    fields=$(get_fields)
+
+    echo "$fields" | jq -r '
+        .fields[] |
+        select(.name == "Status" and .type == "ProjectV2SingleSelectField") |
+        .id
+    '
+}
+
+#######################################
+# Get project node ID
+#######################################
+get_project_id() {
+    local owner_type
+
+    # Determine if owner is user or org
+    if gh api "users/$OWNER" --jq '.type' 2>/dev/null | grep -qi 'organization'; then
+        owner_type="organization"
+    else
+        owner_type="user"
+    fi
+
+    gh api graphql -f query="
+        query {
+            ${owner_type}(login: \"$OWNER\") {
+                projectV2(number: $PROJECT) {
+                    id
+                }
+            }
+        }
+    " --jq ".data.${owner_type}.projectV2.id"
+}
+
+#######################################
+# Get item ID for an issue number
+#######################################
+get_item_id() {
+    local issue_number="$1"
+    local current_repo
+
+    if ! current_repo=$(get_current_repo); then
+        print_error "Could not determine current repository"
+        exit 1
+    fi
+
+    # List items and find the one matching our issue
+    gh project item-list "$PROJECT" --owner "$OWNER" --format json --limit 1000 | \
+        jq -r --arg num "$issue_number" --arg repo "$current_repo" '
+            .items[] |
+            select(.content.number == ($num | tonumber) and
+                   (.content.url | startswith($repo))) |
+            .id
+        ' | head -1
+}
+
+#######################################
+# Setup command - interactive project configuration
+#######################################
+cmd_setup() {
+    print_info "GitHub Projects Setup"
+    echo ""
+
+    # List available projects
+    print_info "Fetching your projects..."
+
+    local my_projects
+    my_projects=$(gh project list --owner "@me" --format json 2>/dev/null || echo '{"projects":[]}')
+
+    local project_count
+    project_count=$(echo "$my_projects" | jq '.projects | length')
+
+    if [[ "$project_count" -eq 0 ]]; then
+        print_warning "No projects found for your user account."
+        echo ""
+        read -rp "Enter project owner (user or org login): " OWNER
+        read -rp "Enter project number: " PROJECT
+    else
+        echo ""
+        print_info "Your projects:"
+        echo "$my_projects" | jq -r '.projects[] | "  \(.number): \(.title)"'
+        echo ""
+
+        read -rp "Enter project number from above, or 'other' for different owner: " choice
+
+        if [[ "$choice" == "other" ]]; then
+            read -rp "Enter project owner (user or org login): " OWNER
+            read -rp "Enter project number: " PROJECT
+        else
+            OWNER=$(gh api user --jq '.login')
+            PROJECT="$choice"
+        fi
+    fi
+
+    # Verify the project exists
+    print_info "Verifying project..."
+    if ! gh project view "$PROJECT" --owner "$OWNER" --format json >/dev/null 2>&1; then
+        print_error "Could not access project $PROJECT for owner $OWNER"
+        print_info "Make sure you have the 'project' scope: gh auth refresh -s project"
+        exit 1
+    fi
+
+    # Ask where to save config
+    echo ""
+    local git_root
+    if git_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+        print_info "Save configuration to:"
+        echo "  1) $git_root/.github-project (this repository)"
+        echo "  2) ~/.config/gh-project-ext/config (global)"
+        read -rp "Choose [1/2]: " config_choice
+
+        if [[ "$config_choice" == "1" ]]; then
+            CONFIG_FILE="$git_root/.github-project"
+        else
+            CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gh-project-ext/config"
+            mkdir -p "$(dirname "$CONFIG_FILE")"
+        fi
+    else
+        CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gh-project-ext/config"
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+    fi
+
+    # Write config
+    cat > "$CONFIG_FILE" << EOF
+owner: $OWNER
+project: $PROJECT
+EOF
+
+    print_success "Configuration saved to $CONFIG_FILE"
+    echo ""
+
+    # Show project info
+    cmd_show
+}
+
+#######################################
+# Show command - display project structure
+#######################################
+cmd_show() {
+    ensure_config
+
+    local project_info
+    project_info=$(gh project view "$PROJECT" --owner "$OWNER" --format json)
+
+    local fields
+    fields=$(get_fields)
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        jq -n \
+            --argjson project "$project_info" \
+            --argjson fields "$fields" \
+            '{project: $project, fields: $fields}'
+        return
+    fi
+
+    echo ""
+    print_color "$BOLD" "Project: $(echo "$project_info" | jq -r '.title')"
+    echo "  Owner: $OWNER"
+    echo "  Number: $PROJECT"
+    echo "  Items: $(echo "$project_info" | jq -r '.items.totalCount')"
+    echo "  URL: $(echo "$project_info" | jq -r '.url')"
+    echo ""
+
+    print_color "$BOLD" "Status Field:"
+    echo "$fields" | jq -r '
+        .fields[] |
+        select(.name == "Status") |
+        .options[] |
+        "  - \(.name) (\(.id))"
+    '
+    echo ""
+
+    print_color "$BOLD" "Priority Field:"
+    echo "$fields" | jq -r '
+        .fields[] |
+        select(.name == "Priority") |
+        .options[] |
+        "  - \(.name) (\(.id))"
+    ' 2>/dev/null || echo "  (not found)"
+    echo ""
+}
+
+#######################################
+# Ready command - list items in Ready status
+#######################################
+cmd_ready() {
+    ensure_config
+
+    local items
+    items=$(gh project item-list "$PROJECT" --owner "$OWNER" --format json --limit 1000)
+
+    local current_repo=""
+    if [[ "$ALL_REPOS" != true ]]; then
+        current_repo=$(get_current_repo) || true
+    fi
+
+    # Filter and sort items
+    local filtered
+    filtered=$(echo "$items" | jq --arg repo "$current_repo" --argjson all_items "$ALL_ITEMS" --argjson all_repos "$ALL_REPOS" '
+        .items |
+        map(select(
+            .status == "Ready" and
+            (if $all_repos then true else ($repo == "" or (.content.url // "" | startswith($repo))) end) and
+            (if $all_items then true else (.content.body // "" | contains("parent-issue") | not) end)
+        )) |
+        sort_by(
+            if .priority == "P0" then 0
+            elif .priority == "P1" then 1
+            elif .priority == "P2" then 2
+            else 3 end
+        )
+    ')
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        echo "$filtered" | jq '{items: .}'
+        return
+    fi
+
+    local count
+    count=$(echo "$filtered" | jq 'length')
+
+    echo ""
+    print_color "$BOLD" "Ready Items ($count)"
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        print_info "No items in Ready status"
+        return
+    fi
+
+    # Group by priority
+    for priority in "P0" "P1" "P2" ""; do
+        local priority_items
+        priority_items=$(echo "$filtered" | jq --arg p "$priority" '[.[] | select(.priority == $p or ($p == "" and .priority == null))]')
+        local priority_count
+        priority_count=$(echo "$priority_items" | jq 'length')
+
+        if [[ "$priority_count" -gt 0 ]]; then
+            local label="${priority:-No Priority}"
+            case "$priority" in
+                P0) print_color "$RED$BOLD" "=== $label ===" ;;
+                P1) print_color "$YELLOW$BOLD" "=== $label ===" ;;
+                P2) print_color "$BLUE$BOLD" "=== $label ===" ;;
+                *)  print_color "$NC" "=== $label ===" ;;
+            esac
+
+            echo "$priority_items" | jq -r '.[] | "  #\(.content.number // "draft"): \(.title)"'
+            echo ""
+        fi
+    done
+}
+
+#######################################
+# Board command - show Kanban board
+#######################################
+cmd_board() {
+    ensure_config
+
+    local items
+    items=$(gh project item-list "$PROJECT" --owner "$OWNER" --format json --limit 1000)
+
+    local current_repo=""
+    if [[ "$ALL_REPOS" != true ]]; then
+        current_repo=$(get_current_repo) || true
+    fi
+
+    # Filter items
+    local filtered
+    filtered=$(echo "$items" | jq --arg repo "$current_repo" --argjson all_items "$ALL_ITEMS" --argjson all_repos "$ALL_REPOS" '
+        .items |
+        map(select(
+            (if $all_repos then true else ($repo == "" or (.content.url // "" | startswith($repo))) end) and
+            (if $all_items then true else (.content.body // "" | contains("parent-issue") | not) end)
+        ))
+    ')
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        echo "$filtered" | jq '{items: .}'
+        return
+    fi
+
+    echo ""
+    print_color "$BOLD" "Kanban Board - $OWNER/projects/$PROJECT"
+    echo ""
+
+    # Show each status column
+    for status in "Backlog" "Ready" "In progress" "In review" "Done"; do
+        local status_items
+        status_items=$(echo "$filtered" | jq --arg s "$status" '[.[] | select(.status == $s)]')
+        local status_count
+        status_count=$(echo "$status_items" | jq 'length')
+
+        case "$status" in
+            "Backlog")     print_color "$MAGENTA$BOLD" "[$status] ($status_count)" ;;
+            "Ready")       print_color "$CYAN$BOLD" "[$status] ($status_count)" ;;
+            "In progress") print_color "$YELLOW$BOLD" "[$status] ($status_count)" ;;
+            "In review")   print_color "$BLUE$BOLD" "[$status] ($status_count)" ;;
+            "Done")        print_color "$GREEN$BOLD" "[$status] ($status_count)" ;;
+        esac
+
+        # Group by priority within status
+        for priority in "P0" "P1" "P2" ""; do
+            local priority_items
+            priority_items=$(echo "$status_items" | jq --arg p "$priority" '[.[] | select(.priority == $p or ($p == "" and .priority == null))]')
+            local priority_count
+            priority_count=$(echo "$priority_items" | jq 'length')
+
+            if [[ "$priority_count" -gt 0 ]]; then
+                local label="${priority:-No Priority}"
+                echo "  $label:"
+                echo "$priority_items" | jq -r '.[] | "    #\(.content.number // "draft"): \(.title | if length > 50 then .[:47] + "..." else . end)"'
+            fi
+        done
+        echo ""
+    done
+}
+
+#######################################
+# Move command - change item status
+#######################################
+cmd_move() {
+    ensure_config
+
+    if [[ $# -lt 2 ]]; then
+        print_error "Usage: gh project-ext move <issue-number> <status>"
+        print_info "Status options: Backlog, Ready, In progress, In review, Done"
+        exit 1
+    fi
+
+    local issue_number="$1"
+    local new_status="$2"
+
+    # Get item ID
+    local item_id
+    item_id=$(get_item_id "$issue_number")
+
+    if [[ -z "$item_id" ]]; then
+        print_error "Issue #$issue_number not found in project"
+        exit 1
+    fi
+
+    # Resolve status to option ID
+    local status_option_id
+    status_option_id=$(resolve_status_id "$new_status")
+
+    if [[ -z "$status_option_id" ]]; then
+        print_error "Invalid status: $new_status"
+        print_info "Valid options: Backlog, Ready, In progress, In review, Done"
+        exit 1
+    fi
+
+    # Get field ID and project ID
+    local status_field_id
+    status_field_id=$(get_status_field_id)
+
+    local project_id
+    project_id=$(get_project_id)
+
+    # Update the item
+    gh api graphql -f query="
+        mutation {
+            updateProjectV2ItemFieldValue(input: {
+                projectId: \"$project_id\"
+                itemId: \"$item_id\"
+                fieldId: \"$status_field_id\"
+                value: {singleSelectOptionId: \"$status_option_id\"}
+            }) {
+                projectV2Item {
+                    id
+                }
+            }
+        }
+    " --silent
+
+    print_success "Moved #$issue_number to $new_status"
+}
+
+#######################################
+# Claim command - assign and move to In Progress
+#######################################
+cmd_claim() {
+    ensure_config
+
+    if [[ $# -lt 1 ]]; then
+        print_error "Usage: gh project-ext claim <issue-number>"
+        exit 1
+    fi
+
+    local issue_number="$1"
+
+    # Move to In Progress
+    cmd_move "$issue_number" "In progress"
+
+    # Assign to current user
+    local current_user
+    current_user=$(gh api user --jq '.login')
+    gh issue edit "$issue_number" --add-assignee "$current_user" 2>/dev/null || true
+
+    print_success "Claimed #$issue_number (assigned to $current_user, moved to In Progress)"
+
+    # Prompt for branch creation
+    echo ""
+    read -rp "Create linked development branch? [y/N] " create_branch
+
+    if [[ "$create_branch" =~ ^[Yy] ]]; then
+        if command -v gh-issue-ext &>/dev/null || gh extension list | grep -q 'issue-ext'; then
+            print_info "Creating linked branch..."
+            gh issue-ext branch create "$issue_number"
+        else
+            print_warning "gh-issue-ext not installed. Install with: gh extension install jwilger/gh-issue-ext"
+            print_info "Creating branch with gh issue develop..."
+            gh issue develop "$issue_number" --checkout
+        fi
+    fi
+}
+
+#######################################
+# Parse arguments (sets global variables, returns remaining args via REMAINING_ARGS)
+#######################################
+REMAINING_ARGS=()
+
+parse_args() {
+    REMAINING_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --owner)
+                OWNER="$2"
+                shift 2
+                ;;
+            --project)
+                PROJECT="$2"
+                shift 2
+                ;;
+            --all)
+                ALL_ITEMS=true
+                shift
+                ;;
+            --all-repos)
+                ALL_REPOS=true
+                shift
+                ;;
+            --json)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+#######################################
+# Main
+#######################################
+main() {
+    # Parse global options first (sets OWNER, PROJECT, etc. and REMAINING_ARGS)
+    parse_args "$@"
+    set -- "${REMAINING_ARGS[@]}"
+
+    # Load config if not overridden by flags
+    if find_config; then
+        load_config
+    fi
+
+    local command="${1:-}"
+    shift || true
+
+    case "$command" in
+        setup)
+            cmd_setup
+            ;;
+        show)
+            cmd_show
+            ;;
+        ready)
+            cmd_ready
+            ;;
+        board)
+            cmd_board
+            ;;
+        move)
+            cmd_move "$@"
+            ;;
+        claim)
+            cmd_claim "$@"
+            ;;
+        ""|--help|-h)
+            show_help
+            ;;
+        *)
+            print_error "Unknown command: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
